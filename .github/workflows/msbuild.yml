@@ -44,7 +44,7 @@ jobs:
       uses: microsoft/setup-msbuild@v2
       with:
         vs-version: ${{ env.VISUAL_STUDIO_VERSION }}
-        msbuild-architecture: ${{ env.BUILD_PLATFORM }}
+        msbuild-architecture: x64
 
     - name: Build Lua 5.3 static libraries
       shell: pwsh
