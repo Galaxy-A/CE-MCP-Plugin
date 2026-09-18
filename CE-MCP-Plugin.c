@@ -29,6 +29,42 @@ char aiServerIP[16] = "127.0.0.1"; // Default AI server IP
 int aiServerPort = 8888; // Default AI server port
 
 
+
+// Use the exact Lua runtime that owns CE's lua_State. Never statically link a
+// second Lua implementation or load an unrelated DLL to operate on that state.
+typedef int (__cdecl *HostLuaGetTop)(lua_State*);
+typedef const char* (__cdecl *HostLuaToLString)(lua_State*, int, size_t*);
+typedef const char* (__cdecl *HostLuaPushString)(lua_State*, const char*);
+typedef void (__cdecl *HostLuaPushCClosure)(lua_State*, lua_CFunction, int);
+typedef void (__cdecl *HostLuaSetGlobal)(lua_State*, const char*);
+static HostLuaGetTop hostLuaGetTop;
+static HostLuaToLString hostLuaToLString;
+static HostLuaPushString hostLuaPushString;
+static HostLuaPushCClosure hostLuaPushCClosure;
+static HostLuaSetGlobal hostLuaSetGlobal;
+
+static BOOL BindHostLua(void) {
+#ifdef _WIN64
+    HMODULE module = GetModuleHandleW(L"lua53-64.dll");
+#else
+    HMODULE module = GetModuleHandleW(L"lua53-32.dll");
+#endif
+    if (module == NULL) return FALSE;
+    hostLuaGetTop = (HostLuaGetTop)GetProcAddress(module, "lua_gettop");
+    hostLuaToLString = (HostLuaToLString)GetProcAddress(module, "lua_tolstring");
+    hostLuaPushString = (HostLuaPushString)GetProcAddress(module, "lua_pushstring");
+    hostLuaPushCClosure = (HostLuaPushCClosure)GetProcAddress(module, "lua_pushcclosure");
+    hostLuaSetGlobal = (HostLuaSetGlobal)GetProcAddress(module, "lua_setglobal");
+    return hostLuaGetTop && hostLuaToLString && hostLuaPushString &&
+        hostLuaPushCClosure && hostLuaSetGlobal;
+}
+
+#define lua_gettop hostLuaGetTop
+#define lua_tolstring hostLuaToLString
+#define lua_pushstring hostLuaPushString
+#define lua_pushcclosure hostLuaPushCClosure
+#define lua_setglobal hostLuaSetGlobal
+
 // Diagnostic build: append initialization evidence to %TEMP%\CE-MCP-Plugin-init.log.
 // Exceptions are logged, not swallowed; CE retains its normal error handling.
 static const char* initStage = "not started";
@@ -1649,7 +1685,7 @@ void __stdcall mainmenuplugin(void) {
 
 BOOL __stdcall CEPlugin_GetVersion(PPluginVersion pv, int sizeofpluginversion) {
     pv->version = CESDK_VERSION;
-    pv->pluginname = "CE-MCP-Plugin v1.0 diagnostic-1 (SDK 6)";
+    pv->pluginname = "CE-MCP-Plugin v1.0 host-lua-1 (SDK 6)";
     return TRUE;
 }
 
@@ -1688,7 +1724,7 @@ int lua_aiSendCommand(lua_State* L) {
 BOOL __stdcall CEPlugin_InitializePlugin(PExportedFunctions ef, int pluginid) {
     __try {
         MAINMENUPLUGIN_INIT init5;
-        InitDiagnosticLog("BEGIN diagnostic-1 pointer_bits=%u pluginid=%d ef=%p",
+        InitDiagnosticLog("BEGIN host-lua-1 pointer_bits=%u pluginid=%d ef=%p",
             (unsigned)(sizeof(void*) * 8), pluginid, (void*)ef);
         SetInitStage("validate SDK");
         if (ef == NULL) return FALSE;
@@ -1701,6 +1737,11 @@ BOOL __stdcall CEPlugin_InitializePlugin(PExportedFunctions ef, int pluginid) {
         selfid = pluginid;
         InitDiagnosticLog("SDK RegisterFunction=%p GetLuaState=%p",
             (void*)Exported.RegisterFunction, (void*)Exported.GetLuaState);
+        SetInitStage("bind CE Lua runtime");
+        if (!BindHostLua()) {
+            InitDiagnosticLog("FAILED CE Lua runtime or required exports unavailable; no fallback runtime loaded");
+            return FALSE;
+        }
         SetInitStage("initialize critical section");
         InitializeCriticalSection(&aiCriticalSection);
         criticalSectionReady = TRUE;
@@ -1721,7 +1762,7 @@ BOOL __stdcall CEPlugin_InitializePlugin(PExportedFunctions ef, int pluginid) {
         LogLoadedLuaModules();
         SetInitStage("GetLuaState");
         lua_State* state = Exported.GetLuaState ? Exported.GetLuaState() : NULL;
-        InitDiagnosticLog("LUA state=%p plugin_lua_pushcclosure=%p plugin_lua_setglobal=%p",
+        InitDiagnosticLog("LUA state=%p bound_lua_pushcclosure=%p bound_lua_setglobal=%p",
             (void*)state, (void*)lua_pushcclosure, (void*)lua_setglobal);
         if (state != NULL) {
             // Expanded lua_register macro to identify the exact failing API call.
