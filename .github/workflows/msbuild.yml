@@ -126,4 +126,6 @@ jobs:
         path: |
           ${{ env.BUILD_PLATFORM }}/${{ env.BUILD_CONFIGURATION }}/CE-MCP-Plugin.dll
           ${{ env.BUILD_CONFIGURATION }}/CE-MCP-Plugin.dll
+          ${{ env.BUILD_PLATFORM }}/${{ env.BUILD_CONFIGURATION }}/CE-MCP-Plugin.pdb
+          ${{ env.BUILD_CONFIGURATION }}/CE-MCP-Plugin.pdb
         retention-days: 30
