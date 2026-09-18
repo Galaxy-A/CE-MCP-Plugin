@@ -207,7 +207,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="bla.cpp" />
     <ClCompile Include="CE-MCP-Plugin.c" />
   </ItemGroup>
   <ItemGroup>
