@@ -190,7 +190,7 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <CallingConvention>
       </CallingConvention>
-      <CompileAs>CompileAsCpp</CompileAs>
+      <CompileAs>CompileAsC</CompileAs>
     </ClCompile>
     <Link>
       <AdditionalOptions>/def:./CE-MCP-Plugin.def %(AdditionalOptions)</AdditionalOptions>
