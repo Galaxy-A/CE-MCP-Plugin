@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <wchar.h>
+#include <tlhelp32.h>
 #include "cepluginsdk.h"
 #include "bla.h"
 
@@ -24,6 +27,82 @@ BOOL isRunning = FALSE;
 CRITICAL_SECTION aiCriticalSection; // Critical section for thread synchronization
 char aiServerIP[16] = "127.0.0.1"; // Default AI server IP
 int aiServerPort = 8888; // Default AI server port
+
+
+// Diagnostic build: append initialization evidence to %TEMP%\CE-MCP-Plugin-init.log.
+// Exceptions are logged, not swallowed; CE retains its normal error handling.
+static const char* initStage = "not started";
+static BOOL criticalSectionReady = FALSE;
+
+static void InitDiagnosticLog(const char* format, ...) {
+    WCHAR path[MAX_PATH];
+    char message[2048];
+    char line[2304];
+    SYSTEMTIME now;
+    va_list args;
+    DWORD written;
+    DWORD length = GetTempPathW(MAX_PATH, path);
+    if (length == 0 || length >= MAX_PATH) return;
+    if (wcscat_s(path, MAX_PATH, L"CE-MCP-Plugin-init.log") != 0) return;
+    va_start(args, format);
+    vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
+    va_end(args);
+    GetLocalTime(&now);
+    sprintf_s(line, sizeof(line), "%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu tid=%lu %s\r\n",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+        now.wMilliseconds, GetCurrentProcessId(), GetCurrentThreadId(), message);
+    OutputDebugStringA(line);
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        WriteFile(file, line, (DWORD)strlen(line), &written, NULL);
+        FlushFileBuffers(file);
+        CloseHandle(file);
+    }
+}
+
+static void SetInitStage(const char* stage) {
+    initStage = stage;
+    InitDiagnosticLog("STAGE %s", stage);
+}
+
+static LONG LogInitException(EXCEPTION_POINTERS* info) {
+    HMODULE module = NULL;
+    char path[MAX_PATH] = "<unknown>";
+    EXCEPTION_RECORD* record = info->ExceptionRecord;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)record->ExceptionAddress, &module)) {
+        GetModuleFileNameA(module, path, MAX_PATH);
+    }
+    InitDiagnosticLog("EXCEPTION stage=%s code=0x%08lX address=%p module=%s offset=0x%IX",
+        initStage, record->ExceptionCode, record->ExceptionAddress, path,
+        (UINT_PTR)record->ExceptionAddress - (UINT_PTR)module);
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+        InitDiagnosticLog("ACCESS_VIOLATION operation=%Iu target=0x%IX (0=read,1=write,8=execute)",
+            record->ExceptionInformation[0], record->ExceptionInformation[1]);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void LogLoadedLuaModules(void) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W entry;
+    ZeroMemory(&entry, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+    if (Module32FirstW(snapshot, &entry)) {
+        do {
+            if (_wcsnicmp(entry.szModule, L"lua", 3) == 0) {
+                InitDiagnosticLog("LUA_MODULE %ls base=%p lua_pushcclosure=%p lua_setglobal=%p",
+                    entry.szExePath, (void*)entry.modBaseAddr,
+                    (void*)GetProcAddress(entry.hModule, "lua_pushcclosure"),
+                    (void*)GetProcAddress(entry.hModule, "lua_setglobal"));
+            }
+        } while (Module32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+}
 
 // AI command structure
 typedef struct {
@@ -1570,7 +1649,7 @@ void __stdcall mainmenuplugin(void) {
 
 BOOL __stdcall CEPlugin_GetVersion(PPluginVersion pv, int sizeofpluginversion) {
     pv->version = CESDK_VERSION;
-    pv->pluginname = "CE-MCP-Plugin v1.0 (SDK version 6: 7.0+)";
+    pv->pluginname = "CE-MCP-Plugin v1.0 diagnostic-1 (SDK 6)";
     return TRUE;
 }
 
@@ -1607,54 +1686,71 @@ int lua_aiSendCommand(lua_State* L) {
 }
 
 BOOL __stdcall CEPlugin_InitializePlugin(PExportedFunctions ef, int pluginid) {
-    MAINMENUPLUGIN_INIT init5;
-
-    selfid = pluginid;
-    
-    // Copy the ExportedFunctions list
-    Exported = *ef;
-    if (Exported.sizeofExportedFunctions != sizeof(Exported)) {
+    __try {
+        MAINMENUPLUGIN_INIT init5;
+        InitDiagnosticLog("BEGIN diagnostic-1 pointer_bits=%u pluginid=%d ef=%p",
+            (unsigned)(sizeof(void*) * 8), pluginid, (void*)ef);
+        SetInitStage("validate SDK");
+        if (ef == NULL) return FALSE;
+        InitDiagnosticLog("SDK host_size=%d plugin_size=%Iu", ef->sizeofExportedFunctions, sizeof(Exported));
+        if (ef->sizeofExportedFunctions != sizeof(Exported)) {
+            InitDiagnosticLog("FAILED SDK size mismatch");
+            return FALSE;
+        }
+        Exported = *ef;
+        selfid = pluginid;
+        InitDiagnosticLog("SDK RegisterFunction=%p GetLuaState=%p",
+            (void*)Exported.RegisterFunction, (void*)Exported.GetLuaState);
+        SetInitStage("initialize critical section");
+        InitializeCriticalSection(&aiCriticalSection);
+        criticalSectionReady = TRUE;
+        SetInitStage("register menu");
+        ZeroMemory(&init5, sizeof(init5));
+        init5.name = "CE-MCP-Plugin";
+        init5.callbackroutine = mainmenuplugin;
+        init5.shortcut = "Ctrl+A";
+        if (Exported.RegisterFunction == NULL) return FALSE;
+        int menuID = Exported.RegisterFunction(pluginid, ptMainMenu, &init5);
+        InitDiagnosticLog("MENU result=%d", menuID);
+        if (menuID == -1) {
+            DeleteCriticalSection(&aiCriticalSection);
+            criticalSectionReady = FALSE;
+            return FALSE;
+        }
+        SetInitStage("inspect Lua modules");
+        LogLoadedLuaModules();
+        SetInitStage("GetLuaState");
+        lua_State* state = Exported.GetLuaState ? Exported.GetLuaState() : NULL;
+        InitDiagnosticLog("LUA state=%p plugin_lua_pushcclosure=%p plugin_lua_setglobal=%p",
+            (void*)state, (void*)lua_pushcclosure, (void*)lua_setglobal);
+        if (state != NULL) {
+            // Expanded lua_register macro to identify the exact failing API call.
+            SetInitStage("lua_pushcclosure");
+            lua_pushcclosure(state, lua_aiSendCommand, 0);
+            SetInitStage("lua_setglobal");
+            lua_setglobal(state, "aiSendCommand");
+            SetInitStage("Lua registration complete");
+        }
+        SetInitStage("start communication thread");
+        EnterCriticalSection(&aiCriticalSection);
+        isRunning = TRUE;
+        aiThread = CreateThread(NULL, 0, AICommunicationThread, NULL, 0, NULL);
+        LeaveCriticalSection(&aiCriticalSection);
+        if (aiThread == NULL) {
+            isRunning = FALSE;
+            InitDiagnosticLog("THREAD failed error=%lu", GetLastError());
+        }
+        SetInitStage("initialization complete");
+        return TRUE;
+    } __except (LogInitException(GetExceptionInformation())) {
+        // Filter always continues exception search; this block is not reached.
         return FALSE;
     }
-
-    // Initialize critical section for thread synchronization
-    InitializeCriticalSection(&aiCriticalSection);
-
-    // Register main menu plugin
-    init5.name = "CE-MCP-Plugin";
-    init5.callbackroutine = mainmenuplugin;
-    init5.shortcut = "Ctrl+A";
-    
-    int mainMenuPluginID = Exported.RegisterFunction(pluginid, ptMainMenu, &init5);
-    if (mainMenuPluginID == -1) {
-        // Silent failure - don't block CE initialization
-        DeleteCriticalSection(&aiCriticalSection);
-        return FALSE;
-    }
-    
-    // Register Lua functions
-    lua_State* lua_state = ef->GetLuaState();
-    if (lua_state != NULL) {
-        lua_register(lua_state, "aiSendCommand", lua_aiSendCommand);
-    }
-    // If Lua state is NULL, silently continue without Lua support
-    
-    // Start AI communication thread (connection will be attempted in the thread)
-    EnterCriticalSection(&aiCriticalSection);
-    isRunning = TRUE;
-    aiThread = CreateThread(NULL, 0, AICommunicationThread, NULL, 0, NULL);
-    LeaveCriticalSection(&aiCriticalSection);
-    
-    if (aiThread == NULL) {
-        // Silent failure - don't block CE initialization
-        isRunning = FALSE;
-    }
-    
-    // Plugin enabled successfully - silent, no UI message to avoid blocking
-    return TRUE;
 }
 
 BOOL __stdcall CEPlugin_DisablePlugin(void) {
+    InitDiagnosticLog("DISABLE begin critical_ready=%d thread=%p", criticalSectionReady, aiThread);
+    if (!criticalSectionReady) return TRUE;
     // Stop AI communication thread
     EnterCriticalSection(&aiCriticalSection);
     isRunning = FALSE;
@@ -1677,6 +1773,8 @@ BOOL __stdcall CEPlugin_DisablePlugin(void) {
     
     // Delete critical section
     DeleteCriticalSection(&aiCriticalSection);
+    criticalSectionReady = FALSE;
+    InitDiagnosticLog("DISABLE complete");
     
     // Plugin disabled successfully - silent, no UI message to avoid blocking
     return TRUE;
